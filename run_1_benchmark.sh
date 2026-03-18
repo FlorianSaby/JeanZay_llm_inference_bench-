@@ -1,6 +1,6 @@
 #!/bin/bash
 set -a  # Automatically export all variables
-source .a100env
+source a100env
 set +a  # Stop automatically exporting
 
 # Load utility functions
