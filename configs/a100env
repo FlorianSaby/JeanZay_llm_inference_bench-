@@ -1,0 +1,27 @@
+# ENVIRONMENT PATH
+ENVIRONMENT_VLLM=/lustre/fshomisc/sup/hpe/pub/miniforge/24.11.3/envs/pytorch-gpu-2.7.0+py3.12.10
+SCRIPT_VLLM=scripts/vllm/run_ray_vllm.sh
+
+# ADDITIONAL VARIABLES
+PORT=8000
+BENCHMARK_FILE=/lustre/fsn1/projects/rech/rxy/unq39gs/test_ray/benchmarks/benchmark_serving.py
+
+# Modules to load for activating the environment
+# Note: If you are using a different environment, please change the modules accordingly.
+MODULES="arch/a100 pytorch-gpu/py3/2.7.0"
+module load $MODULES
+CONDA_PATH="$(conda info --base)/etc/profile.d/conda.sh"
+# SUPERCOMPUTER SPECIFIC
+
+SUPCOMPUTER_NAME="Jean Zay A100"
+PARTITION_NAME="gpu_p5"
+ACCOUNT=rxy@a100
+QOS=qos_gpu_a100-t3 #qos_gpu_h100-dev
+CONSTRAINT=a100
+TIME_LIMIT=2:00:00
+GPUS_PER_NODE=8
+CPUS_PER_NODE=64
+VRAM_PER_NODE=320  #use GByte not Gbit
+
+
+
