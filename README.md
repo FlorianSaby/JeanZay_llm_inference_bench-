@@ -31,3 +31,8 @@ If you are using the code directly with the datasets and models in the `DSDIR` f
 ## Step 5 (Optional): Analyze Results
 - Use `bench_analysis.ipynb` to interpret the generated Excel file.
 
+## Benchmark Results
+Benchmark results are shown in the image below:
+
+![Benchmark Results](results_bench.png)
+
