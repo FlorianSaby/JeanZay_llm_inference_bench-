@@ -1,7 +1,7 @@
 # Benchmark Instructions
 
 ## Notes
-If you are using the code directly with the datasets and models in the `DSDIR` folder, steps 1 and 2 can be skipped.
+If you are using the code directly with the datasets and models in the `DSDIR` folder, steps 1 can be skipped.
 
 ## Step 1: Download Datasets and Models
 
