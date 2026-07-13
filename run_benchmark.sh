@@ -1,6 +1,6 @@
 #!/bin/bash
 set -a  # Automatically export all variables
-source configs/a100env
+source configs/h100env
 set +a  # Stop automatically exporting
 
 # Load utility functions
@@ -11,9 +11,9 @@ source scripts/utils.sh
 #######################################################
 FRAMEWORKS=( "vllm" )
 DATASETS=(  "sharegpt" "sonnet")  # "sharegpt"
-MODELS=("meta-llama/Llama-3.1-8B-Instruct" "meta-llama/Llama-3.1-70B-Instruct" "meta-llama/Llama-3.1-405B-Instruct" ) # "meta-llama/Llama-3.1-405B-Instruct" "meta-llama/Llama-3.1-70B-Instruct"
+MODELS=("meta-llama/Llama-3.1-405B-Instruct" "meta-llama/Llama-3.1-70B-Instruct" "meta-llama/Llama-3.1-8B-Instruct") # "meta-llama/Llama-3.1-405B-Instruct" "meta-llama/Llama-3.1-70B-Instruct" "meta-llama/Llama-3.1-8B-Instruct"
 NUMBER_OF_NODES=(4) #You can let 4 Since DP is not working code will regulate number of nodes to use only the right number
-REPEATS=3               # Number of runs per configuration
+REPEATS=3             # Number of runs per configuration
 #######################################################
 echo $ACCOUNT
 GPUS_PER_NODE=$GPUS_PER_NODE
@@ -109,7 +109,7 @@ for framework in "${FRAMEWORKS[@]}"; do
             LAUNCH_FOLDER="${CURRENT_DIR}/${FULL_FOLDER}/launch-${run_id}"
             echo "Setting up $LAUNCH_FOLDER"
             mkdir -p "$LAUNCH_FOLDER"
-             
+
             cp $SCRIPT_VLLM "$LAUNCH_FOLDER"
             FILE_NAME="${SCRIPT_VLLM##*/}"
             cd "$LAUNCH_FOLDER" || exit 1
@@ -118,7 +118,7 @@ for framework in "${FRAMEWORKS[@]}"; do
             export MODEL_PATH RAY_PATH
             export ADDITIONAL_ARGS
             export MODULES
-	
+
             REMAINING=$((TOTAL_CONFIGS - CONFIG_INDEX))
             if [ "$REMAINING" -le 5 ] && [ "${#JOB_IDS[@]}" -gt 0 ]; then
               DEPENDENCY="--dependency=afterany:${JOB_IDS[-1]}"
