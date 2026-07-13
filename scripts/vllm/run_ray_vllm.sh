@@ -3,39 +3,113 @@
 set -euo pipefail
 
 ########################################
-# 1. Environment
+# 1. Environment (Singularity)
 ########################################
-module purge
-module load $MODULES
-
-# Ray sanity
 export RAY_DISABLE_DOCKER_CPU_WARNING=1
-export RAY_USAGE_STATS_ENABLED=1
-export RAY_NUM_GPUS=$GPUS_PER_NODE
-export RAY_NUM_CPUS=$CPUS_PER_NODE
+export RAY_USAGE_STATS_ENABLED=0
+export RAY_NUM_GPUS="$GPUS_PER_NODE"
+export RAY_NUM_CPUS="$CPUS_PER_NODE"
 export VLLM_USE_V1=0
 export VLLM_USE_RAY_SPANNABLE_POOL=0
 export VLLM_USE_RAY_COMPILED_DAG=0
 export RAY_CGRAPH_get_timeout=1800
-NB_NODES=$NODES
+NB_NODES="$NODES"
+
+export SINGULARITY_BINDS
+export SINGULARITY_IMAGE
+
+sing() {
+  singularity exec --nv -B "$SINGULARITY_BINDS" "$SINGULARITY_IMAGE" "$@"
+}
+export -f sing
+
+RAY_SRUN_PID=""
+VLLM_PID=""
+GPU_MON_PID=""
+
+cleanup() {
+  set +e
+  if [[ -n "${GPU_MON_PID:-}" ]]; then
+    kill "$GPU_MON_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${VLLM_PID:-}" ]]; then
+    kill "$VLLM_PID" >/dev/null 2>&1 || true
+  fi
+  sing ray stop --force >/dev/null 2>&1 || true
+  if [[ -n "${RAY_SRUN_PID:-}" ]]; then
+    kill "$RAY_SRUN_PID" >/dev/null 2>&1 || true
+    wait "$RAY_SRUN_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
 
 ########################################
-# 2. Robust InfiniBand detection (IPv4 only)
+# 2. Network detection without iproute2
 ########################################
-IB_IFACE=$(ip -4 -o addr show | awk '{print $2}' | grep -E '^(ib|hsn|sl)' | head -n 1)
+# This uses only Python's standard library, so it works even when the host
+# and the container do not provide the `ip` command.
+NET_INFO_PY=$(cat <<'PY'
+import fcntl
+import os
+import re
+import socket
+import struct
+import sys
 
-if [ -z "$IB_IFACE" ]; then
-  echo "ERROR: No InfiniBand interface with IPv4 found"
-  ip -4 addr show
+pattern = re.compile(r"^(ib|hsn|sl)")
+interfaces = sorted(os.listdir("/sys/class/net"))
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+for iface in interfaces:
+    if not pattern.match(iface):
+        continue
+    try:
+        request = struct.pack("256s", iface[:15].encode())
+        response = fcntl.ioctl(sock.fileno(), 0x8915, request)  # SIOCGIFADDR
+        ipv4 = socket.inet_ntoa(response[20:24])
+    except OSError:
+        continue
+    print(iface, ipv4)
+    break
+else:
+    print(
+        "No ib*/hsn*/sl* interface with an IPv4 address. Available: "
+        + ", ".join(interfaces),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+)
+export NET_INFO_PY
+
+########################################
+# 3. Node discovery and head-node address
+########################################
+nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+readarray -t nodes_array <<< "$nodes"
+head_node=${nodes_array[0]}
+
+head_info=$(srun --nodes=1 --ntasks=1 -w "$head_node" \
+  singularity exec --nv \
+  -B "$SINGULARITY_BINDS" \
+  "$SINGULARITY_IMAGE" \
+  python -c "$NET_INFO_PY")
+
+read -r IB_IFACE head_node_ip <<< "$head_info"
+if [[ -z "${IB_IFACE:-}" || -z "${head_node_ip:-}" ]]; then
+  echo "ERROR: Could not determine the high-speed interface and IPv4 address" >&2
   exit 1
 fi
 
-IB_IP_CMD="ip -4 addr show $IB_IFACE | awk '/inet / {split(\$2,a,\"/\"); print a[1]}'"
+echo "Ray head node: $head_node"
+echo "High-speed network: $IB_IFACE ($head_node_ip)"
+
+export RAY_HEAD_IP="$head_node_ip"
+export RAY_ADDRESS="$RAY_HEAD_IP:6379"
 
 ########################################
-# 3. NCCL (force IB, prevent silent TCP fallback)
+# 4. NCCL
 ########################################
-
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET
 export NCCL_IB_DISABLE=0
@@ -43,76 +117,75 @@ export NCCL_IB_HCA=mlx5
 export NCCL_IB_TIMEOUT=23
 export NCCL_IB_RETRY_CNT=10
 export NCCL_NET_GDR_LEVEL=2
-export NCCL_SOCKET_IFNAME=$IB_IFACE
+export NCCL_SOCKET_IFNAME="$IB_IFACE"
 export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_P2P_DISABLE=0
-
-########################################
-# 4. Node discovery
-########################################
-
-nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-nodes_array=($nodes)
-head_node=${nodes_array[0]}
-
-# Si on est sur 1 seul nœud, on récupère l'IP directement sans srun
-if [ "$NB_NODES" -eq 1 ]; then
-    head_node_ip=$(eval "$IB_IP_CMD")
-else
-    head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" bash -c "$IB_IP_CMD")
-fi
-
-export RAY_HEAD_IP="$head_node_ip"
-export RAY_ADDRESS="$RAY_HEAD_IP:6379"
 
 ########################################
 # 5. Launch Ray cluster
 ########################################
-ray stop --force || true
+sing ray stop --force || true
 sleep 5
 
-srun --nodes=$NB_NODES \
-     --ntasks=$NB_NODES \
+srun --nodes="$NB_NODES" \
+     --ntasks="$NB_NODES" \
      --ntasks-per-node=1 \
-     bash -c "
+     singularity exec --nv \
+     -B "$SINGULARITY_BINDS" \
+     "$SINGULARITY_IMAGE" \
+     bash -c '
 set -euo pipefail
-local_ip=\$($IB_IP_CMD)
-export RAY_NODE_IP_ADDRESS=\$local_ip
-export VLLM_HOST_IP=\$local_ip
-export HOST_IP=\$local_ip
 
-echo \"[\$(hostname)] Starting Ray on IP: \$local_ip\"
-
-if [ \"\$SLURM_PROCID\" -eq 0 ]; then
-    ray start --head \
-      --node-ip-address=\$local_ip \
-      --port=6379 \
-      --num-cpus=$CPUS_PER_NODE \
-      --num-gpus=$GPUS_PER_NODE \
-      --disable-usage-stats \
-      --block
-else
-    # Worker Nodes (if scaling > 1)
-    until (echo > /dev/tcp/$RAY_HEAD_IP/6379) >/dev/null 2>&1; do
-      echo \"Waiting for Ray head at $RAY_HEAD_IP...\"
-      sleep 2
-    done
-    ray start \
-      --address=$RAY_ADDRESS \
-      --node-ip-address=\$local_ip \
-      --num-cpus=$CPUS_PER_NODE \
-      --num-gpus=$GPUS_PER_NODE \
-      --disable-usage-stats \
-      --block
+read -r local_iface local_ip <<< "$(python -c "$NET_INFO_PY")"
+if [[ -z "$local_iface" || -z "$local_ip" ]]; then
+  echo "[$(hostname)] Failed to determine local network information" >&2
+  exit 1
 fi
-" &
+
+export RAY_NODE_IP_ADDRESS="$local_ip"
+export VLLM_HOST_IP="$local_ip"
+export HOST_IP="$local_ip"
+export NCCL_SOCKET_IFNAME="$local_iface"
+
+echo "[$(hostname)] Starting Ray on $local_iface ($local_ip)"
+
+if [[ "$SLURM_PROCID" -eq 0 ]]; then
+  exec ray start --head \
+    --node-ip-address="$RAY_NODE_IP_ADDRESS" \
+    --port=6379 \
+    --num-cpus="$CPUS_PER_NODE" \
+    --num-gpus="$GPUS_PER_NODE" \
+    --disable-usage-stats \
+    --block
+else
+  until python -c "import socket; socket.create_connection((\"$RAY_HEAD_IP\", 6379), timeout=2).close()" \
+      >/dev/null 2>&1; do
+    echo "[$(hostname)] Waiting for Ray head at $RAY_HEAD_IP:6379..."
+    sleep 2
+  done
+
+  exec ray start \
+    --address="$RAY_ADDRESS" \
+    --node-ip-address="$RAY_NODE_IP_ADDRESS" \
+    --num-cpus="$CPUS_PER_NODE" \
+    --num-gpus="$GPUS_PER_NODE" \
+    --disable-usage-stats \
+    --block
+fi
+' &
+RAY_SRUN_PID=$!
 
 ########################################
 # 6. Wait for Ray
 ########################################
 sleep 60
-ray status || { echo "Ray failed to start"; exit 1; }
-
+if ! kill -0 "$RAY_SRUN_PID" 2>/dev/null; then
+  echo "Ray srun step exited before the cluster became ready" >&2
+  wait "$RAY_SRUN_PID" || true
+  exit 1
+fi
+sing ray status || { echo "Ray failed to start" >&2; exit 1; }
 
 ########################################
 # 7. Launch vLLM
@@ -121,44 +194,53 @@ export VLLM_RAY_USE_EXISTING_CLUSTER=1
 export VLLM_HOST_IP="$RAY_HEAD_IP"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-# Force NCCL to use the InfiniBand interface found earlier
-export NCCL_SOCKET_IFNAME=$IB_IFACE
-
-
-echo "Launching vLLM on $head_node ($RAY_HEAD_IP)"
 PORT=8000
-python -u -m vllm.entrypoints.openai.api_server \
+echo "Launching vLLM on $head_node ($RAY_HEAD_IP:$PORT)"
+
+sing python -u -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_PATH" \
-  --tensor-parallel-size $TENSOR_PARALLEL \
-  --pipeline-parallel-size $PIPELINE_PARALLEL \
+  --tensor-parallel-size "$TENSOR_PARALLEL" \
+  --pipeline-parallel-size "$PIPELINE_PARALLEL" \
   --distributed-executor-backend ray \
   --disable-custom-all-reduce \
   --dtype bfloat16 \
   --max-model-len 8192 \
   --host "$RAY_HEAD_IP" \
-  --port $PORT \
+  --port "$PORT" \
   --trust-remote-code &
 VLLM_PID=$!
-########################################
-# 8. Wait for Health Check & Inference Request
-########################################
-echo "Waiting for vLLM to initialize weights (Model: 405B)..."
 
-# Use /v1/models instead of /health for a stricter readiness check
-timeout 1800 bash -c "
-until [ \"\$(curl -s -o /dev/null -w ''%{http_code}'' http://$RAY_HEAD_IP:8000/v1/models)\" == \"200\" ]; do
-    echo \"Still loading weights...\"
-    sleep 20
+########################################
+# 8. Wait for vLLM and test it
+########################################
+echo "Waiting for vLLM to initialize weights (Model: $MODEL_PATH)..."
+deadline=$((SECONDS + 1800))
+
+while true; do
+  http_code=$(sing curl -s -o /dev/null -w '%{http_code}' \
+    "http://$RAY_HEAD_IP:$PORT/v1/models" || true)
+
+  if [[ "$http_code" == "200" ]]; then
+    break
+  fi
+
+  if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+    echo "vLLM exited before becoming ready" >&2
+    wait "$VLLM_PID" || true
+    exit 1
+  fi
+
+  if (( SECONDS >= deadline )); then
+    echo "vLLM server failed to become ready within 30 minutes" >&2
+    exit 1
+  fi
+
+  echo "Still loading weights... HTTP status: ${http_code:-none}"
+  sleep 20
 done
-" || {
-  echo "vLLM server failed to become ready within 30 minutes"
-  kill $VLLM_PID
-  exit 1
-}
 
 echo "Server is UP. Sending inference request..."
-
-curl -X POST http://$RAY_HEAD_IP:8000/v1/chat/completions \
+sing curl -X POST "http://$RAY_HEAD_IP:$PORT/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d "{
     \"model\": \"$MODEL_PATH\",
@@ -169,8 +251,12 @@ curl -X POST http://$RAY_HEAD_IP:8000/v1/chat/completions \
   }"
 
 echo -e "\nInference test complete."
-#############################################
-concurrencies=(50 100 150 200 250 300 350 400 450 500 550 600 650 700 750 800 850 900 950 1000)
+
+########################################
+# 9. Benchmarking loop
+########################################
+concurrencies=(50) # 100 150 200 250 300 350 400 450 500 550 600 650 700 750 800 850 900 950 1000)
+
 for conc in "${concurrencies[@]}"; do
   echo "======================================="
   echo "Running concurrency level $conc"
@@ -181,16 +267,14 @@ for conc in "${concurrencies[@]}"; do
   LOG_FILE="$LAUNCH_FOLDER/logs_benchmarking_${conc}_concurrency.log"
   RESULT_FILE="$LAUNCH_FOLDER/Concurrency_${conc}.json"
 
-  # Start GPU monitoring (all GPUs on the node where this runs)
-  nvidia-smi --query-gpu=timestamp,index,name,memory.used,power.draw,utilization.gpu,utilization.memory \
-             --format=csv,noheader,nounits -l 1 > "$METRICS_FILE" &
+  sing nvidia-smi \
+    --query-gpu=timestamp,index,name,memory.used,power.draw,utilization.gpu,utilization.memory \
+    --format=csv,noheader,nounits -l 1 > "$METRICS_FILE" &
   GPU_MON_PID=$!
 
-  # Run benchmark against the vLLM server
-  # IMPORTANT: use $RAY_HEAD_IP not localhost (unless your benchmark runs on the same head node and you know that’s true)
   set +e
-  python "$BENCHMARK_FILE" \
-    --backend 'vllm' \
+  sing python "$BENCHMARK_FILE" \
+    --backend vllm \
     --host "$RAY_HEAD_IP" \
     --port "$PORT" \
     --model "$MODEL_PATH" \
@@ -204,12 +288,13 @@ for conc in "${concurrencies[@]}"; do
   RC=$?
   set -e
 
-  # Stop monitoring
   kill "$GPU_MON_PID" >/dev/null 2>&1 || true
+  wait "$GPU_MON_PID" >/dev/null 2>&1 || true
+  GPU_MON_PID=""
   sleep 2
 
-  if [ "$RC" -ne 0 ]; then
-    echo "Benchmark failed at concurrency=$conc (exit code $RC). See: $LOG_FILE"
+  if [[ "$RC" -ne 0 ]]; then
+    echo "Benchmark failed at concurrency=$conc (exit code $RC). See: $LOG_FILE" >&2
     exit "$RC"
   fi
 
@@ -217,11 +302,4 @@ for conc in "${concurrencies[@]}"; do
 done
 
 echo "All concurrency runs completed successfully."
-
-
-########################################
-# 9. Cleanup
-########################################
 echo "Shutting down..."
-kill $VLLM_PID
-ray stop --force
