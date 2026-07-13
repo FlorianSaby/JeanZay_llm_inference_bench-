@@ -8,7 +8,7 @@ import subprocess
 
 # You need to have activated your virtual enviornment.
 from dotenv import load_dotenv
-load_dotenv("configs/a100env")
+load_dotenv("configs/h100env")
 
 
 
